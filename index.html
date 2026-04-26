@@ -1,0 +1,1068 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>주은혜교회 재정청구시스템</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@100..900&display=swap');
+        body { font-family: 'Pretendard', sans-serif; -webkit-font-smoothing: antialiased; letter-spacing: -0.025em; text-align: left; }
+        .animate-in { animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }
+        input:focus { border-color: #3b82f6 !important; outline: none; background-color: #fff !important; }
+        .loading-overlay { background: rgba(255,255,255,0.85); backdrop-filter: blur(5px); z-index: 9999; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+    </style>
+</head>
+<body class="bg-gray-50 antialiased selection:bg-blue-100 overflow-x-hidden text-left">
+
+    <div id="app-root" class="min-h-screen flex flex-col"></div>
+
+    <script>
+        // --- 1. 전역 상수 및 설정 ---
+        const ROLES = {
+            APPLICANT: '재정신청자', DEPARTMENT_HEAD: '부서장', MANAGER: '관리자', GL_CHAIRMAN: '관리위원장',
+            JJ_CHAIRMAN: '교육위원장', SK_CHAIRMAN: '예배위원장', YB_CHAIRMAN: '전도위원장',
+            KL_CHAIRMAN: '선교위원장', FINANCE_CHAIRMAN: '재정위원장', REPRESENTATIVE: '담임목사'
+        };
+        
+        const CHAIRMAN_ROLES = [ROLES.GL_CHAIRMAN, ROLES.JJ_CHAIRMAN, ROLES.SK_CHAIRMAN, ROLES.YB_CHAIRMAN, ROLES.KL_CHAIRMAN];
+        const ROLE_ORDER = [ROLES.APPLICANT, ROLES.DEPARTMENT_HEAD, ROLES.MANAGER, ROLES.GL_CHAIRMAN, ROLES.JJ_CHAIRMAN, ROLES.SK_CHAIRMAN, ROLES.YB_CHAIRMAN, ROLES.KL_CHAIRMAN, ROLES.FINANCE_CHAIRMAN, ROLES.REPRESENTATIVE];
+        const STATUS = {
+            PENDING_0: '부서장결재대기', PENDING_1: '1차결재대기', PENDING_2: '2차결재대기', PENDING_FINAL: '최종결재대기',
+            PENDING_PAYMENT: '지급대기', COMPLETED: '지급완료', REJECTED: '반려'
+        };
+
+        // --- 2. 전역 상태 ---
+        let state = {
+            gasUrl: "https://script.google.com/macros/s/AKfycbzbsSgZ7OiDBy6Zs9zQMGCUCjsVIsK7L1hlqDtabE2ZNJGvUFO6NPamLS7-Yb7fdeHe/exec",
+            user: JSON.parse(localStorage.getItem('a_finance_user')) || null,
+            claims: [],
+            users: [],
+            settings: { 
+                lastSerial: 0, 
+                rolePassword: "elgrace1189!!", 
+                appLoginPassword: "4735", 
+                folderId: "" 
+            },
+            activeTab: 'dashboard',
+            isLoading: false,
+            selectedClaim: null,
+            filter: {
+                startDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+                endDate: new Date().toISOString().split('T')[0]
+            }
+        };
+
+        // --- 3. 입력 폼 및 임시 데이터 ---
+        let reqItems = [{ id: Date.now(), title: '', amount: 0, bankName: '', account: '', owner: '' }];
+        let reqTarget = CHAIRMAN_ROLES[0];
+        let reqDeptHeadName = ""; // 지정된 부서장 이름
+        let reqAttachments = [];
+        let upgradeTargetRole = "";
+        let editingClaimId = null;
+
+        // --- 4. 유틸리티 함수 ---
+        function getBadgeHtml(s) {
+            const configs = {
+                [STATUS.PENDING_0]: 'bg-teal-50 text-teal-600 label:부서장 결재중',
+                [STATUS.PENDING_1]: 'bg-blue-50 text-blue-600 label:1차 결재중',
+                [STATUS.PENDING_2]: 'bg-indigo-50 text-indigo-600 label:2차 결재중',
+                [STATUS.PENDING_FINAL]: 'bg-purple-50 text-purple-600 label:최종 승인중',
+                [STATUS.PENDING_PAYMENT]: 'bg-amber-100 text-amber-700 label:지급 대기',
+                [STATUS.COMPLETED]: 'bg-green-100 text-green-600 label:지급 완료',
+                [STATUS.REJECTED]: 'bg-red-50 text-red-500 label:반려됨',
+                [ROLES.APPLICANT]: 'bg-gray-100 text-gray-500 label:신청자',
+                [ROLES.DEPARTMENT_HEAD]: 'bg-teal-50 text-teal-600 label:부서장',
+                [ROLES.MANAGER]: 'bg-red-50 text-red-600 label:관리자',
+                [ROLES.FINANCE_CHAIRMAN]: 'bg-blue-50 text-blue-600 label:재정위원',
+                [ROLES.REPRESENTATIVE]: 'bg-purple-50 text-purple-600 label:담임목사'
+            };
+            const item = configs[s] || `bg-gray-100 text-gray-400 label:${s}`;
+            const [cls, label] = item.split(' label:');
+            return `<span class="text-[10px] font-black px-3 py-1.5 rounded-full ${cls} whitespace-nowrap">${label}</span>`;
+        }
+
+        const isAdminUser = () => state.user?.role === ROLES.MANAGER || state.user?.role === ROLES.REPRESENTATIVE;
+
+        const canEditDoc = (c) => {
+            const role = state.user.role;
+            if ([ROLES.MANAGER, ROLES.FINANCE_CHAIRMAN, ROLES.REPRESENTATIVE].includes(role)) return true;
+            const isPending = [STATUS.PENDING_0, STATUS.PENDING_1, STATUS.PENDING_2, STATUS.PENDING_FINAL].includes(c.status);
+            if (!isPending) return false;
+            if (c.requesterUid === state.user.uid) return true;
+            if (c.history?.some(h => h.user === state.user.name)) return true;
+            return false;
+        };
+
+        const canDeleteDoc = (c) => {
+            if (c.status === STATUS.COMPLETED) return false;
+            const role = state.user.role;
+            if ([ROLES.MANAGER, ROLES.FINANCE_CHAIRMAN, ROLES.REPRESENTATIVE].includes(role)) return true;
+            if (c.requesterUid === state.user.uid) return true;
+            return false;
+        };
+
+        function showMessage(msg, type = 'info') {
+            let toast = document.getElementById('toast-msg');
+            if(!toast) {
+                toast = document.createElement('div');
+                toast.id = 'toast-msg';
+                document.body.appendChild(toast);
+            }
+            toast.innerText = msg;
+            toast.className = `fixed top-4 right-4 z-[1000] px-6 py-4 rounded-2xl shadow-2xl text-white font-black animate-in slide-in-from-right-4 ${type === 'error' ? 'bg-red-500' : 'bg-blue-600'}`;
+            toast.style.display = 'block';
+            setTimeout(() => { if(toast) toast.style.display = 'none'; }, 4000);
+        }
+
+        function renderLoading(show) {
+            let loader = document.getElementById('global-loader');
+            if (!loader && show) {
+                loader = document.createElement('div');
+                loader.id = 'global-loader';
+                loader.className = 'fixed inset-0 flex flex-col items-center justify-center loading-overlay';
+                loader.innerHTML = `<i data-lucide="loader-2" class="animate-spin text-blue-600 w-12 h-12 mb-4"></i><p class="font-black text-blue-600">처리 중입니다... 잠시만 기다려주세요.</p>`;
+                document.body.appendChild(loader);
+                lucide.createIcons();
+            } else if (loader && !show) { 
+                loader.remove(); 
+            }
+        }
+
+        const resizeImage = (file) => {
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.src = e.target.result;
+                    img.onload = () => {
+                        const canvas = document.createElement('canvas');
+                        let maxWidth = 800; 
+                        let quality = 0.6;
+                        let resultData = '';
+
+                        const compress = () => {
+                            const scale = img.width > maxWidth ? maxWidth / img.width : 1;
+                            canvas.width = img.width * scale;
+                            canvas.height = img.height * scale;
+                            const ctx = canvas.getContext('2d');
+                            
+                            ctx.fillStyle = '#ffffff';
+                            ctx.fillRect(0, 0, canvas.width, canvas.height);
+                            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                            
+                            resultData = canvas.toDataURL('image/jpeg', quality);
+                            
+                            if (resultData.length > 15000) {
+                                if (maxWidth > 400) {
+                                    maxWidth -= 100;
+                                    compress();
+                                } else if (quality > 0.2) {
+                                    quality -= 0.1;
+                                    compress();
+                                } else {
+                                    resolve(resultData);
+                                }
+                            } else {
+                                resolve(resultData);
+                            }
+                        };
+                        compress();
+                    };
+                };
+            });
+        };
+
+        function showFullScreenImage(src) {
+            const overlay = document.createElement('div');
+            overlay.className = 'fixed inset-0 z-[9999] bg-black/90 flex items-center justify-center p-4 cursor-pointer transition-opacity animate-in fade-in';
+            overlay.onclick = () => overlay.remove(); 
+
+            const img = document.createElement('img');
+            img.src = src;
+            img.className = 'max-w-full max-h-full object-contain rounded-lg shadow-2xl';
+            
+            const closeHint = document.createElement('div');
+            closeHint.className = 'absolute top-6 right-6 bg-black/50 text-white p-2 rounded-full hover:bg-white/20 transition-colors';
+            closeHint.innerHTML = '<i data-lucide="x"></i>';
+
+            overlay.appendChild(img);
+            overlay.appendChild(closeHint);
+            document.body.appendChild(overlay);
+            
+            lucide.createIcons();
+        }
+
+        // --- 5. API 통신 ---
+        async function fetchFromGas(payload) {
+            try {
+                const res = await fetch(state.gasUrl, {
+                    method: 'POST',
+                    redirect: 'follow', 
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, 
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+                return await res.json();
+            } catch (e) {
+                return { success: false, error: "서버 연결에 실패했습니다. GAS 배포 권한이 '모든 사용자'로 설정되었는지 확인하세요." };
+            }
+        }
+
+        async function callApi(action, data = {}) {
+            if (!state.gasUrl) {
+                showMessage("서버 URL이 설정되지 않았습니다.", "error");
+                return { success: false };
+            }
+            state.isLoading = true; renderLoading(true);
+            try {
+                const result = await fetchFromGas({ action, ...data, userUid: state.user?.uid });
+                
+                if (result.success) {
+                    await refreshData(); 
+                    return { success: true, ...result };
+                } else {
+                    showMessage(result.error || "처리 중 오류가 발생했습니다.", "error");
+                    return { success: false, error: result.error };
+                }
+            } finally { 
+                state.isLoading = false; 
+                renderLoading(false); 
+            }
+        }
+
+        async function refreshData() {
+            if (!state.gasUrl) return false;
+            
+            const data = await fetchFromGas({ action: 'getInitialData', userUid: state.user?.uid });
+            
+            if (data && data.success) {
+                state.claims = (data.claims || []).map(c => {
+                    if (typeof c.items === 'string') try { c.items = JSON.parse(c.items); } catch(e) { c.items = []; }
+                    if (typeof c.attachments === 'string') try { c.attachments = JSON.parse(c.attachments); } catch(e) { c.attachments = []; }
+                    if (typeof c.history === 'string') try { c.history = JSON.parse(c.history); } catch(e) { c.history = []; }
+                    
+                    // 💡 핵심 우회 조치: 시트에 Column이 없더라도 저장되는 history JSON 데이터에서 부서장 이름을 빼옵니다.
+                    if (c.history && c.history.length > 0 && c.history[0].targetDeptHead) {
+                        c.targetDeptHead = c.history[0].targetDeptHead;
+                    }
+                    return c;
+                });
+                state.users = data.users || [];
+                state.settings = { ...state.settings, ...data.settings };
+                
+                if (state.user) {
+                    const updatedMe = state.users.find(u => u.uid === state.user.uid);
+                    if (updatedMe) {
+                        state.user = updatedMe;
+                        localStorage.setItem('a_finance_user', JSON.stringify(updatedMe));
+                    }
+                }
+                render();
+                return true;
+            }
+            return false;
+        }
+
+        // --- 6. 화면 렌더링 ---
+        function render() {
+            const root = document.getElementById('app-root');
+            if (!state.gasUrl) return renderSetupScreen(root);
+            if (!state.user) return renderAuthScreen(root);
+            renderLayout(root);
+            lucide.createIcons();
+        }
+
+        function renderSetupScreen(el) {
+            el.innerHTML = `
+                <div class="min-h-screen flex items-center justify-center bg-indigo-900 p-6 animate-in">
+                    <div class="bg-white p-10 rounded-[2.5rem] shadow-2xl w-full max-w-md">
+                        <div class="flex items-center gap-3 mb-6"><div class="bg-indigo-100 p-3 rounded-2xl text-indigo-600"><i data-lucide="server"></i></div><h2 class="text-2xl font-black text-gray-800 tracking-tighter">시스템 설정</h2></div>
+                        <p class="text-sm text-gray-400 font-bold mb-8 leading-relaxed">준비된 GAS 웹 앱 URL을 입력하여 연결을 시작하세요.</p>
+                        <div class="space-y-6">
+                            <div class="text-left"><label class="text-[10px] font-black text-gray-400 ml-1 uppercase">Web App URL</label><input id="setup-url" type="url" class="w-full p-4 bg-gray-50 border-2 rounded-2xl font-mono text-xs mt-1" placeholder="https://script.google.com/macros/s/.../exec"></div>
+                            <button id="setup-btn" onclick="saveSetup()" class="w-full bg-indigo-600 text-white p-5 rounded-2xl font-black text-lg shadow-xl hover:bg-indigo-700 flex items-center justify-center gap-2 transition-all"><i data-lucide="link"></i> 연결 확인 및 저장</button>
+                        </div>
+                    </div>
+                </div>`;
+        }
+
+        async function saveSetup() {
+            const url = document.getElementById('setup-url').value;
+            if (!url.startsWith('https://')) return showMessage("유효한 https 주소를 입력하세요.", "error");
+            
+            const btn = document.getElementById('setup-btn');
+            const originText = btn.innerHTML;
+            btn.innerHTML = `<i data-lucide="loader-2" class="animate-spin w-5 h-5"></i> 연결 확인 중...`;
+            btn.disabled = true;
+            lucide.createIcons();
+
+            state.gasUrl = url;
+            const data = await fetchFromGas({ action: 'getInitialData' });
+            
+            if (data && data.success) { 
+                localStorage.setItem('a_finance_gas_url', url); 
+                await refreshData();
+            } else { 
+                state.gasUrl = ""; 
+                btn.innerHTML = originText;
+                btn.disabled = false;
+                lucide.createIcons();
+                showMessage(data.error || "연결 실패! 구글 앱스 스크립트 배포 상태를 확인하세요.", "error"); 
+            }
+        }
+
+        function renderAuthScreen(el) {
+            el.innerHTML = `
+                <div class="min-h-screen flex items-center justify-center bg-blue-600 p-6 animate-in text-left">
+                    <div class="bg-white p-10 rounded-[2.5rem] shadow-2xl w-full max-w-md">
+                        <div class="flex justify-between items-start mb-8">
+                            <h1 class="text-4xl font-black text-gray-800 uppercase tracking-tighter">주은혜 재정청구</h1>
+                            <button onclick="resetSetup()" class="text-[10px] text-gray-300 underline font-bold">서버 재설정</button>
+                        </div>
+                        <div class="space-y-6">
+                            <div class="text-left"><label class="text-[10px] font-black text-gray-400 ml-1 uppercase">성함</label><input id="login-name" type="text" class="w-full p-4 bg-gray-50 border-2 rounded-2xl font-bold" placeholder="실명을 입력하세요"></div>
+                            <div class="text-left"><label class="text-[10px] font-black text-gray-400 ml-1 uppercase">휴대폰 번호</label><input id="login-phone" type="tel" class="w-full p-4 bg-gray-50 border-2 rounded-2xl font-bold" placeholder="(- 없이 입력)"></div>
+                            <div class="text-left"><label class="text-[10px] font-black text-gray-400 ml-1 uppercase">앱 비밀번호</label><input id="login-pw" type="password" class="w-full p-4 bg-gray-50 border-2 rounded-2xl text-center font-black tracking-widest" placeholder="PASSWORD"></div>
+                            <button onclick="handleLogin()" class="w-full bg-blue-600 text-white p-5 rounded-2xl font-black text-lg shadow-xl hover:bg-blue-700 transition-all text-center">시스템 가입 및 접속</button>
+                        </div>
+                    </div>
+                </div>`;
+        }
+
+        async function handleLogin() {
+            const name = document.getElementById('login-name').value;
+            const phone = document.getElementById('login-phone').value.replace(/[^0-9]/g, '');
+            const password = document.getElementById('login-pw').value;
+            
+            if(!name || !phone || !password) return showMessage("정보를 모두 입력하세요.", "error");
+            if(String(password) !== String(state.settings.appLoginPassword || '4735')) return showMessage("앱 접속 비밀번호가 올바르지 않습니다.", "error");
+
+            const uid = 'u_' + phone;
+
+            const existingUser = state.users.find(u => u.uid === uid);
+            const userRole = existingUser ? existingUser.role : ROLES.APPLICANT;
+
+            const userData = { uid: uid, name, phone, password, role: userRole };
+            
+            if(await callApi('loginOrRegister', userData)) {
+                state.user = userData;
+                localStorage.setItem('a_finance_user', JSON.stringify(userData));
+                await refreshData();
+            }
+        }
+
+        function resetSetup() { localStorage.clear(); location.reload(); }
+
+        function resetAndSwitchToRequest() {
+            reqItems = [{ id: Date.now(), title: '', amount: 0, bankName: '', account: '', owner: state.user.name }];
+            reqTarget = CHAIRMAN_ROLES[0];
+            reqDeptHeadName = "";
+            reqAttachments = [];
+            editingClaimId = null;
+            switchTab('request');
+        }
+
+        function renderLayout(el) {
+            const isAdmin = isAdminUser();
+            el.innerHTML = `
+                <div class="flex h-screen bg-gray-50 text-gray-900 overflow-hidden text-left">
+                    <aside class="hidden md:flex flex-col w-72 bg-white border-r shrink-0">
+                        <div class="p-8 border-b text-blue-600 flex items-center gap-3 font-black"><i data-lucide="shield-check"></i><span class="text-xl uppercase tracking-tighter">주은혜교회 재정청구</span></div>
+                        <nav class="flex-1 p-6 space-y-2 overflow-y-auto no-scrollbar">
+                            <button onclick="switchTab('dashboard')" class="w-full flex items-center gap-4 px-5 py-4 rounded-2xl font-bold ${state.activeTab==='dashboard'?'bg-blue-600 text-white shadow-lg':'text-gray-500 hover:bg-gray-100'}"><i data-lucide="layout-dashboard"></i> 대시보드</button>
+                            <button onclick="resetAndSwitchToRequest()" class="w-full flex items-center gap-4 px-5 py-4 rounded-2xl font-bold ${state.activeTab==='request'?'bg-blue-600 text-white shadow-lg':'text-gray-500 hover:bg-gray-100'}"><i data-lucide="file-plus"></i> 재정 신청</button>
+                            <button onclick="switchTab('approval')" class="w-full flex items-center gap-4 px-5 py-4 rounded-2xl font-bold ${state.activeTab==='approval'?'bg-blue-600 text-white shadow-lg':'text-gray-500 hover:bg-gray-100'}"><i data-lucide="clipboard-check"></i> 결재 관리</button>
+                            <button onclick="switchTab('profile')" class="w-full flex items-center gap-4 px-5 py-4 rounded-2xl font-bold ${state.activeTab==='profile'?'bg-blue-600 text-white shadow-lg':'text-gray-500 hover:bg-gray-100'}"><i data-lucide="user-cog"></i> 내 정보</button>
+                            ${isAdmin ? `<button onclick="switchTab('admin')" class="w-full flex items-center gap-4 px-5 py-4 rounded-2xl font-bold ${state.activeTab==='admin'?'bg-blue-600 text-white shadow-lg':'text-gray-500 hover:bg-gray-100'}"><i data-lucide="settings"></i> 관리자</button>` : ''}
+                        </nav>
+                        <div class="p-6 border-t bg-gray-50/50">
+                            <div class="flex items-center gap-3 bg-white p-3 rounded-2xl border mb-3">
+                                <div class="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center font-black text-blue-600 text-xs">${state.user.role.substring(0,2)}</div>
+                                <div class="overflow-hidden text-left"><p class="text-xs font-black truncate">${state.user.name}</p><p class="text-[9px] text-gray-400 font-bold">${state.user.role}</p></div>
+                            </div>
+                            <button onclick="logout()" class="w-full p-2 text-red-500 font-bold hover:bg-red-50 rounded-xl flex items-center justify-center gap-2 text-xs transition-all"><i data-lucide="log-out"></i> 로그아웃</button>
+                        </div>
+                    </aside>
+                    <main class="flex-1 flex flex-col overflow-hidden bg-gray-50 text-left">
+                        <header class="md:hidden flex items-center justify-between p-5 bg-white border-b shadow-sm shrink-0"><div class="text-blue-600 font-black tracking-tighter">주은혜교회 재정청구</div><button onclick="switchTab('profile')" class="p-2 bg-blue-50 text-blue-600 rounded-full"><i data-lucide="user"></i></button></header>
+                        <div id="content-area" class="flex-1 overflow-y-auto p-4 md:p-10 no-scrollbar"></div>
+                        <nav class="md:hidden grid grid-cols-4 bg-white border-t p-2 h-20 items-center shadow-2xl shrink-0">
+                            <button onclick="switchTab('dashboard')" class="flex flex-col items-center ${state.activeTab==='dashboard'?'text-blue-600':'text-gray-400'}"><i data-lucide="layout-dashboard"></i><span class="text-[10px] font-bold">홈</span></button>
+                            <button onclick="resetAndSwitchToRequest()" class="flex flex-col items-center ${state.activeTab==='request'?'text-blue-600':'text-gray-400'}"><i data-lucide="file-plus"></i><span class="text-[10px] font-bold">신청</span></button>
+                            <button onclick="switchTab('approval')" class="flex flex-col items-center ${state.activeTab==='approval'?'text-blue-600':'text-gray-400'}"><i data-lucide="clipboard-check"></i><span class="text-[10px] font-bold">결재</span></button>
+                            <button onclick="switchTab('profile')" class="flex flex-col items-center ${state.activeTab==='profile'?'text-blue-600':'text-gray-400'}"><i data-lucide="user-cog"></i><span class="text-[10px] font-bold">정보</span></button>
+                        </nav>
+                    </main>
+                </div>
+                <div id="modal-container" class="text-left"></div>
+                <div id="toast-msg" style="display:none"></div>`;
+            renderTabContent();
+        }
+
+        function switchTab(tab) { 
+            if(tab !== 'request') editingClaimId = null; 
+            state.activeTab = tab; 
+            state.selectedClaim = null; 
+            render(); 
+        }
+        function logout() { localStorage.removeItem('a_finance_user'); state.user = null; render(); }
+
+        function renderTabContent() {
+            const area = document.getElementById('content-area');
+            if(!area) return;
+            switch(state.activeTab) {
+                case 'dashboard': renderDashboard(area); break;
+                case 'request': renderRequestForm(area); break;
+                case 'approval': renderApprovalList(area); break;
+                case 'profile': renderProfile(area); break;
+                case 'admin': renderAdmin(area); break;
+            }
+        }
+
+        function renderDashboard(el) {
+            const role = state.user.role;
+            let list = state.claims || [];
+            
+            if (isAdminUser() || role === ROLES.FINANCE_CHAIRMAN) {
+            } else if (role === ROLES.DEPARTMENT_HEAD) {
+                // 부서장 권한을 가졌으며, 자신의 이름과 일치하는 문서만 노출되도록 필터링 처리
+                list = list.filter(c => 
+                    (c.status === STATUS.PENDING_0 && (c.targetDeptHead || '').trim() === state.user.name.trim()) || 
+                    c.history?.some(h => h.user === state.user.name) || 
+                    c.requesterUid === state.user.uid
+                );
+            } else if (CHAIRMAN_ROLES.includes(role)) { 
+                list = list.filter(c => c.targetChairman === role || c.requesterUid === state.user.uid); 
+            } else { 
+                list = list.filter(c => c.requesterUid === state.user.uid); 
+            }
+            
+            const filtered = list.filter(c => {
+                const cDate = c.createdAt.split('T')[0];
+                return cDate >= state.filter.startDate && cDate <= state.filter.endDate;
+            });
+            el.innerHTML = `
+                <div class="space-y-8 animate-in text-left">
+                    <div class="flex items-center justify-between">
+                        <h2 class="text-3xl font-black text-gray-800 tracking-tighter">대시보드</h2>
+                        <button onclick="refreshData()" class="text-blue-600 font-bold flex items-center gap-2 text-sm bg-white px-4 py-2 rounded-xl border border-blue-100 shadow-sm"><i data-lucide="refresh-cw" size="14"></i> 동기화</button>
+                    </div>
+                    <div class="bg-white p-6 rounded-[2rem] shadow-sm border border-gray-100 flex flex-col md:flex-row gap-4 items-end">
+                        <div class="flex-1 w-full text-left"><label class="text-[10px] font-black text-gray-400 ml-1 mb-2 block">조회 기간</label>
+                            <div class="flex items-center gap-2"><input type="date" id="d-start" value="${state.filter.startDate}" onchange="updateDashFilter()" class="flex-1 p-3 bg-gray-50 border rounded-xl font-bold"><span class="text-gray-300">~</span><input type="date" id="d-end" value="${state.filter.endDate}" onchange="updateDashFilter()" class="flex-1 p-3 bg-gray-50 border rounded-xl font-bold"></div>
+                        </div>
+                        <div class="bg-blue-50 px-6 py-3 rounded-xl border border-blue-100 flex items-center gap-3"><span class="text-xs font-black text-blue-400">전체</span><span class="text-xl font-black text-blue-600">${filtered.length}건</span></div>
+                    </div>
+                    <div class="bg-white rounded-[2rem] shadow-sm border border-gray-100 overflow-hidden text-left"><div class="overflow-x-auto"><table class="w-full text-left min-w-[700px]"><thead class="bg-gray-50 border-b text-[10px] font-black text-gray-400 uppercase tracking-widest text-left"><tr><th class="p-4 text-left">신청일</th><th class="p-4 text-left">기안자</th><th class="p-4 text-left">내용</th><th class="p-4 text-right">금액</th><th class="p-4 text-center">상태</th></tr></thead><tbody class="divide-y divide-gray-100">
+                        ${filtered.length === 0 ? `<tr><td colspan="5" class="py-20 text-center text-gray-300 font-bold">내역이 없습니다.</td></tr>` : 
+                            filtered.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).map(c => `
+                            <tr onclick="viewDetail('${c.id}')" class="hover:bg-blue-50/50 cursor-pointer group transition-colors text-left"><td class="p-4 text-sm font-bold text-gray-500 font-mono text-left">${c.createdAt.split('T')[0]}</td><td class="p-4 text-sm font-black text-gray-800 text-left">${c.requesterName}</td><td class="p-4 text-sm font-bold text-gray-600 truncate max-w-[250px] group-hover:text-blue-600 transition-colors text-left">${c.items[0]?.title || '내용없음'}</td><td class="p-4 text-sm font-black text-blue-600 text-right text-right">${Number(c.totalAmount).toLocaleString()}원</td><td class="p-4 text-center text-center">${getBadgeHtml(c.status)}</td></tr>`).join('')}
+                    </tbody></table></div></div>
+                </div>`;
+            lucide.createIcons();
+        }
+
+        function updateDashFilter() { 
+            state.filter.startDate = document.getElementById('d-start').value; 
+            state.filter.endDate = document.getElementById('d-end').value; 
+            renderDashboard(document.getElementById('content-area')); 
+        }
+
+        function renderRequestForm(el) {
+            reqItems[0].owner = reqItems[0].owner || state.user.name;
+            const total = reqItems.reduce((a,c)=>a+Number(c.amount||0), 0);
+            const isEditing = !!editingClaimId;
+
+            const targetOptions = [...CHAIRMAN_ROLES, ROLES.FINANCE_CHAIRMAN];
+            const deptHeads = state.users.filter(u => u.role === ROLES.DEPARTMENT_HEAD);
+
+            el.innerHTML = `
+                <div class="max-w-4xl mx-auto space-y-8 animate-in text-left">
+                    <h2 class="text-3xl font-black text-gray-800 tracking-tighter">${isEditing ? '재정 신청서 수정' : '재정 신청서 작성'}</h2>
+                    <div class="bg-white p-8 rounded-[2.5rem] shadow-sm border border-gray-100 space-y-10">
+                        <section class="space-y-4 text-left">
+                            <h3 class="text-lg font-black text-gray-800 flex items-center gap-2"><i data-lucide="user-check" class="text-blue-600"></i> 결재 부서장 지정</h3>
+                            <div class="relative">
+                                <input type="text" list="dept-heads-list" oninput="reqDeptHeadName=this.value" value="${reqDeptHeadName}" placeholder="결재를 올릴 부서장 성함을 입력하거나 선택하세요" class="w-full md:w-1/2 p-3 border-2 border-gray-100 rounded-xl font-bold bg-gray-50 outline-none focus:border-blue-500 text-sm">
+                                <datalist id="dept-heads-list">
+                                    ${deptHeads.map(u => `<option value="${u.name}"></option>`).join('')}
+                                </datalist>
+                            </div>
+                        </section>
+                        <section class="space-y-4 text-left"><h3 class="text-lg font-black text-gray-800 flex items-center gap-2"><i data-lucide="users" class="text-blue-600"></i> 결재 위원장 선택</h3><div class="grid grid-cols-2 md:grid-cols-6 gap-2">
+                            ${targetOptions.map(r => `<button onclick="reqTarget='${r}';renderRequestForm(document.getElementById('content-area'))" class="p-3 rounded-xl font-black text-[10px] border-2 transition-all ${reqTarget===r?'bg-blue-600 text-white border-blue-600 shadow-lg':'bg-gray-50 text-gray-400 border-transparent'}">${r}</button>`).join('')}
+                        </div></section>
+                        <section class="space-y-4 text-left"><div class="flex justify-between items-center"><h3 class="text-lg font-black text-gray-800">상세 내역</h3><div class="flex gap-2"><button onclick="copyAcc()" class="bg-amber-50 text-amber-600 px-3 py-1.5 rounded-lg text-[10px] font-black border border-amber-200">계좌복사</button><button onclick="addReqRow()" class="bg-blue-600 text-white p-2 rounded-lg"><i data-lucide="plus"></i></button></div></div>
+                            <div class="space-y-4 text-left">${reqItems.map((item, idx) => `
+                                <div class="bg-gray-50 p-6 rounded-3xl border border-gray-100 relative grid grid-cols-1 md:grid-cols-12 gap-3 text-left">
+                                    <div class="md:col-span-8 text-left"><label class="text-[8px] font-black text-gray-400 uppercase">품명/사유</label><input oninput="reqItems[${idx}].title=this.value" class="w-full p-2 border rounded-lg font-bold" value="${item.title}" placeholder="내역 입력"></div>
+                                    <div class="md:col-span-4 text-right"><label class="text-[8px] font-black text-gray-400 uppercase">금액</label><input type="number" oninput="reqItems[${idx}].amount=Number(this.value);updateReqSum()" class="w-full p-2 border rounded-lg font-black text-blue-600 text-right" value="${item.amount}"></div>
+                                    <div class="md:col-span-3 text-left"><input oninput="reqItems[${idx}].bankName=this.value" class="w-full p-2 border rounded-lg text-xs" placeholder="은행명" value="${item.bankName}"></div>
+                                    <div class="md:col-span-6 text-left"><input oninput="reqItems[${idx}].account=this.value" class="w-full p-2 border rounded-lg text-xs font-mono" placeholder="계좌번호" value="${item.account}"></div>
+                                    <div class="md:col-span-3 text-left"><input oninput="reqItems[${idx}].owner=this.value" class="w-full p-2 border border-blue-100 rounded-lg text-xs" placeholder="예금주" value="${item.owner}"></div>
+                                    ${reqItems.length>1?`<button onclick="reqItems.splice(${idx},1);renderRequestForm(document.getElementById('content-area'))" class="absolute -top-2 -right-2 bg-white text-red-500 p-1.5 rounded-full border shadow-sm"><i data-lucide="trash-2" class="w-3 h-3"></i></button>`:''}
+                                </div>`).join('')}</div>
+                            <div class="bg-blue-600 p-6 rounded-3xl flex justify-between font-black text-xl text-white shadow-xl shadow-blue-100"><span>총 합계</span><div><span id="req-sum-view">${total.toLocaleString()}</span>원</div></div>
+                        </section>
+                        <section class="space-y-4 text-left"><h3 class="text-lg font-black text-gray-800 flex items-center gap-2"><i data-lucide="image" class="text-blue-600"></i> 증빙 첨부</h3><div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            ${reqAttachments.map((f, i) => `<div class="aspect-square rounded-2xl overflow-hidden border relative group"><img src="${f.data}" class="w-full h-full object-cover"><button onclick="reqAttachments.splice(${i},1);renderRequestForm(document.getElementById('content-area'))" class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white"><i data-lucide="trash-2" class="w-3 h-3"></i></button></div>`).join('')}
+                            <label class="aspect-square border-2 border-dashed rounded-2xl flex flex-col items-center justify-center text-gray-300 cursor-pointer hover:bg-blue-50 transition-all"><i data-lucide="plus" size={32}></i><input type="file" multiple class="hidden" accept="image/*" onchange="handleReqUpload(this)"></label>
+                        </div></section>
+                        <button onclick="submitRequest()" class="w-full bg-blue-600 text-white p-5 rounded-2xl font-black text-xl shadow-xl hover:bg-blue-700 transition-all text-center">${isEditing ? '수정 완료' : '신청서 제출'}</button>
+                    </div>
+                </div>`;
+            lucide.createIcons();
+        }
+
+        function updateReqSum() { 
+            const total = reqItems.reduce((a,c)=>a+Number(c.amount||0), 0); 
+            const el = document.getElementById('req-sum-view'); 
+            if(el) el.innerText = total.toLocaleString(); 
+        }
+
+        function addReqRow() { 
+            reqItems.push({ id: Date.now(), title: '', amount: 0, bankName: '', account: '', owner: state.user.name }); 
+            renderRequestForm(document.getElementById('content-area')); 
+        }
+
+        function copyAcc() { 
+            const f = reqItems[0]; 
+            reqItems.forEach(i => { i.bankName = f.bankName; i.account = f.account; i.owner = f.owner; }); 
+            renderRequestForm(document.getElementById('content-area')); 
+        }
+
+        async function handleReqUpload(el) { 
+            const files = Array.from(el.files); 
+            renderLoading(true);
+            for(let f of files) { const data = await resizeImage(f); reqAttachments.push({data}); } 
+            el.value = '';
+            renderLoading(false);
+            renderRequestForm(document.getElementById('content-area')); 
+        }
+
+        async function submitRequest() {
+            if(!reqDeptHeadName) return showMessage("결재를 올릴 부서장 성함을 지정해주세요.", "error");
+            if(reqItems.some(i => !i.title || !i.amount || !i.bankName || !i.account)) return showMessage("필수 항목을 모두 입력하세요.", "error");
+            
+            if (JSON.stringify(reqAttachments).length > 45000) {
+                return showMessage("첨부파일 전체 용량이 너무 큽니다. 불필요한 사진을 지워주세요.", "error");
+            }
+
+            const total = reqItems.reduce((a,c)=>a+Number(c.amount||0), 0);
+            
+            if (editingClaimId) {
+                const existingClaim = state.claims.find(c => c.id === editingClaimId);
+                const updatedHistory = [...(existingClaim.history || []), {step: '내용 수정', user: state.user.name, date: new Date().toISOString()}];
+                
+                // 💡 수정 시에도 부서장 정보 보존
+                if (updatedHistory.length > 0) {
+                    updatedHistory[0].targetDeptHead = reqDeptHeadName.trim();
+                }
+
+                const updatedClaim = {
+                    ...existingClaim,
+                    targetDeptHead: reqDeptHeadName.trim(),
+                    targetChairman: reqTarget,
+                    items: reqItems,
+                    totalAmount: total,
+                    attachments: reqAttachments,
+                    history: updatedHistory
+                };
+
+                if(await callApi('updateClaim', updatedClaim)) { 
+                    showMessage("성공적으로 수정되었습니다.", "success"); 
+                    resetAndSwitchToRequest(); 
+                    switchTab('dashboard'); 
+                }
+            } else {
+                const claim = { 
+                    requesterUid: state.user.uid, requesterName: state.user.name, requesterPhone: state.user.phone, 
+                    targetDeptHead: reqDeptHeadName.trim(),
+                    targetChairman: reqTarget, items: reqItems, totalAmount: total, attachments: reqAttachments, 
+                    status: STATUS.PENDING_0, createdAt: new Date().toISOString(), 
+                    // 💡 핵심: 부서장 이름을 구글 시트에 안전하게 보관하기 위해 history 속성에 심어둡니다.
+                    history: [{step: '최초신청', user: state.user.name, date: new Date().toISOString(), targetDeptHead: reqDeptHeadName.trim()}] 
+                };
+                if(await callApi('addClaim', claim)) { 
+                    showMessage("제출 성공!", "success"); 
+                    resetAndSwitchToRequest(); 
+                    switchTab('dashboard'); 
+                }
+            }
+        }
+
+        function closeModal() {
+            const container = document.getElementById('modal-container');
+            if(container) container.innerHTML = '';
+            state.selectedClaim = null;
+        }
+
+        function startEdit(id) {
+            const c = state.claims.find(cl => cl.id === id);
+            if(!c) return;
+            editingClaimId = c.id;
+            reqDeptHeadName = c.targetDeptHead || '';
+            reqTarget = c.targetChairman;
+            reqItems = JSON.parse(JSON.stringify(c.items)); 
+            reqAttachments = Array.isArray(c.attachments) ? JSON.parse(JSON.stringify(c.attachments)) : []; 
+            closeModal();
+            switchTab('request');
+        }
+
+        async function executeDelete(id) {
+            const result = await callApi('deleteClaim', { id });
+            if (result && result.success) {
+                closeModal();
+                showMessage("문서가 성공적으로 삭제되었습니다.", "success");
+            }
+        }
+
+        function confirmDelete(id, btn) {
+            if (btn.dataset.confirm === "true") {
+                executeDelete(id);
+            } else {
+                const oriText = btn.innerHTML;
+                btn.innerHTML = `<i data-lucide="alert-triangle" class="w-4 h-4"></i> 한번 더 눌러 삭제`;
+                btn.classList.add('bg-red-500', 'text-white');
+                btn.classList.remove('bg-red-50', 'text-red-500', 'hover:bg-red-100');
+                btn.dataset.confirm = "true";
+                lucide.createIcons();
+                
+                setTimeout(() => {
+                    if (btn && document.body.contains(btn)) {
+                        btn.innerHTML = oriText;
+                        btn.classList.remove('bg-red-500', 'text-white');
+                        btn.classList.add('bg-red-50', 'text-red-500', 'hover:bg-red-100');
+                        btn.dataset.confirm = "false";
+                        lucide.createIcons();
+                    }
+                }, 3000);
+            }
+        }
+
+        function viewDetail(id) {
+            const claim = state.claims.find(c => c.id === id);
+            if(!claim) return;
+            state.selectedClaim = claim;
+            const canAct = canActionDoc(claim);
+            const canEdit = canEditDoc(claim);
+            const canDelete = canDeleteDoc(claim);
+
+            const deptApprovedStep = claim.history?.find(h => h.step.includes(ROLES.DEPARTMENT_HEAD));
+            const deptName = deptApprovedStep ? deptApprovedStep.user : (claim.targetDeptHead || '미지정');
+            const deptApproved = !!deptApprovedStep;
+
+            const chairmanUser = state.users.find(u => u.role === claim.targetChairman);
+            const finUser = state.users.find(u => u.role === ROLES.FINANCE_CHAIRMAN);
+            const repUser = state.users.find(u => u.role === ROLES.REPRESENTATIVE);
+
+            const chairmanApproved = claim.history?.some(h => h.step.includes(claim.targetChairman));
+            const finApproved = claim.history?.some(h => h.step.includes(ROLES.FINANCE_CHAIRMAN));
+            const repApproved = claim.history?.some(h => h.step.includes(ROLES.REPRESENTATIVE));
+
+            const getStampHtml = (roleName, userName, status) => {
+                let borderColor = 'border-gray-200';
+                let headBg = 'bg-gray-50 text-gray-400 border-gray-200';
+                let nameColor = 'text-gray-300';
+                let stampMark = '';
+
+                if (status === 'req') {
+                    borderColor = 'border-blue-200';
+                    headBg = 'bg-blue-50 text-blue-600 border-blue-200';
+                    nameColor = 'text-gray-800';
+                    stampMark = `<span class="absolute text-[8px] text-blue-500 font-black border border-blue-500 rounded-sm px-1 transform -rotate-12 opacity-60">기안</span>`;
+                } else if (status === 'approved') {
+                    borderColor = 'border-blue-200';
+                    headBg = 'bg-blue-50 text-blue-600 border-blue-200';
+                    nameColor = 'text-gray-800';
+                    stampMark = `<span class="absolute text-[8px] text-blue-500 font-black border border-blue-500 rounded-sm px-1 transform -rotate-12 opacity-60">승인</span>`;
+                }
+
+                return `
+                <div class="border rounded-lg overflow-hidden flex flex-col text-center w-[4.5rem] shrink-0 ${borderColor}">
+                    <div class="${headBg} text-[10px] font-black p-1.5 border-b truncate">${roleName}</div>
+                    <div class="h-12 flex flex-col items-center justify-center bg-white relative">
+                        <span class="text-xs font-bold ${nameColor} z-10">${userName || '-'}</span>
+                        ${stampMark}
+                    </div>
+                </div>`;
+            };
+
+            const stampsHtml = `
+                <div class="flex gap-2 overflow-x-auto no-scrollbar py-2">
+                    ${getStampHtml('기안자', claim.requesterName, 'req')}
+                    ${getStampHtml('부서장', deptName, deptApproved ? 'approved' : 'pending')}
+                    ${getStampHtml(claim.targetChairman, chairmanUser?.name, chairmanApproved ? 'approved' : 'pending')}
+                    ${getStampHtml('재정위원장', finUser?.name, finApproved ? 'approved' : 'pending')}
+                    ${getStampHtml('담임목사', repUser?.name, repApproved ? 'approved' : 'pending')}
+                </div>
+            `;
+
+            const modalContainer = document.getElementById('modal-container');
+            modalContainer.innerHTML = `
+                <div class="fixed inset-0 z-[500] flex items-center justify-center p-4 bg-gray-900/70 backdrop-blur-sm animate-in text-left">
+                    <div class="bg-white w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-[2rem] shadow-2xl relative flex flex-col no-scrollbar">
+                        <div class="p-6 border-b flex justify-between items-center sticky top-0 bg-white z-10">
+                            <div class="flex items-center gap-3 text-left"><div class="p-2 bg-blue-50 text-blue-600 rounded-xl"><i data-lucide="file-text"></i></div><h3 class="text-xl font-black text-gray-800 tracking-tighter">상세 내용</h3></div>
+                            <div class="flex items-center gap-2">
+                                ${canEdit ? `<button onclick="startEdit('${claim.id}')" class="flex items-center gap-1.5 px-3 py-2 bg-amber-50 text-amber-600 rounded-xl hover:bg-amber-100 font-black text-xs transition-colors"><i data-lucide="edit-3" class="w-4 h-4"></i> 수정</button>` : ''}
+                                ${canDelete ? `<button onclick="confirmDelete('${claim.id}', this)" data-confirm="false" class="flex items-center gap-1.5 px-3 py-2 bg-red-50 text-red-500 rounded-xl hover:bg-red-100 font-black text-xs transition-colors"><i data-lucide="trash-2" class="w-4 h-4"></i> 삭제</button>` : ''}
+                                <button onclick="closeModal()" class="p-2 hover:bg-gray-100 rounded-full text-gray-400 transition-colors"><i data-lucide="x"></i></button>
+                            </div>
+                        </div>
+                        <div class="p-8 space-y-8 flex-1">
+                            <div class="space-y-4">
+                                <div class="flex justify-between items-end">
+                                    <div class="space-y-1">
+                                        <p class="text-[10px] font-black text-gray-400 uppercase">진행 상태</p>
+                                        ${getBadgeHtml(claim.status)}
+                                    </div>
+                                </div>
+                                <div class="bg-gray-50 p-4 rounded-2xl border">
+                                    <p class="text-[10px] font-black text-gray-400 uppercase mb-3">결재 라인</p>
+                                    ${stampsHtml}
+                                </div>
+                            </div>
+                            <div class="space-y-3">
+                                ${claim.items.map(i => `<div class="p-4 bg-gray-50 rounded-2xl border text-left"><div class="flex justify-between font-black mb-2"><span>${i.title}</span><span class="text-blue-600">${i.amount.toLocaleString()}원</span></div><p class="text-[10px] text-gray-400 text-left">${i.bankName} ${i.account} (${i.owner})</p></div>`).join('')}
+                                <div class="bg-blue-600 text-white p-5 rounded-2xl flex justify-between font-black text-lg"><span>총 합계</span><span>${claim.totalAmount.toLocaleString()}원</span></div>
+                            </div>
+                            <div class="space-y-2 mt-4 border-t pt-6">
+                                <p class="text-[10px] font-black text-gray-400 uppercase">증빙 첨부 자료</p>
+                                ${claim.attachments?.length > 0 ? `<div class="grid grid-cols-2 gap-2 text-left">${claim.attachments.map(a => `<img src="${a.data}" class="rounded-2xl border w-full shadow-sm object-cover hover:opacity-80 transition-opacity" onclick="showFullScreenImage('${a.data}')" style="cursor:pointer; max-height: 200px;" title="클릭하여 크게 보기">`).join('')}</div>` : '<p class="text-xs text-gray-400 font-bold">첨부된 증빙이 없습니다.</p>'}
+                            </div>
+                            ${canAct ? `
+                                <div class="pt-8 border-t space-y-4">
+                                    ${claim.status === STATUS.PENDING_PAYMENT ? `<div class="bg-amber-50 p-6 rounded-2xl border-2 border-amber-200 text-left"><label class="block text-xs font-black text-amber-700 mb-3">지급 완료일 선택</label><input type="date" id="p-date" class="w-full p-4 border-2 border-amber-100 rounded-xl font-black text-lg bg-white"></div>` : ''}
+                                    <button id="flow-btn" onclick="handleFlow('${claim.id}')" class="w-full p-6 bg-blue-600 text-white rounded-[2rem] font-black text-xl shadow-2xl hover:bg-blue-700 transition-all text-center">결재 승인 / 보관</button>
+                                </div>` : ''}
+                        </div>
+                    </div>
+                </div>`;
+            lucide.createIcons();
+        }
+
+        async function handleFlow(id) {
+            const btn = document.getElementById('flow-btn');
+            const c = state.claims.find(cl => cl.id === id);
+            if(!c) return;
+
+            if (c.status === STATUS.PENDING_PAYMENT) {
+                const pd = document.getElementById('p-date')?.value;
+                if(!pd) return showMessage("지급 완료일을 선택해주세요.", "error");
+                return renderArchivePreview(c, pd);
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = `<i data-lucide="loader-2" class="animate-spin w-5 h-5 mx-auto"></i>`;
+            lucide.createIcons();
+
+            let nextStatus;
+            const role = state.user.role;
+            
+            if (role === ROLES.DEPARTMENT_HEAD) nextStatus = STATUS.PENDING_1;
+            else if (CHAIRMAN_ROLES.includes(role)) nextStatus = STATUS.PENDING_2;
+            else if (role === ROLES.FINANCE_CHAIRMAN) nextStatus = STATUS.PENDING_FINAL;
+            else if (role === ROLES.REPRESENTATIVE) nextStatus = STATUS.PENDING_PAYMENT;
+            else if (isAdminUser()) {
+                if(c.status === STATUS.PENDING_0) nextStatus = STATUS.PENDING_1;
+                else if(c.status === STATUS.PENDING_1) nextStatus = STATUS.PENDING_2;
+                else if(c.status === STATUS.PENDING_2) nextStatus = STATUS.PENDING_FINAL;
+                else if(c.status === STATUS.PENDING_FINAL) nextStatus = STATUS.PENDING_PAYMENT;
+            }
+
+            const history = [...(c.history || []), {step: `${role} 승인`, user: state.user.name, date: new Date().toISOString()}];
+            const updatedClaim = { ...c, status: nextStatus, history };
+
+            if (updatedClaim.attachments && JSON.stringify(updatedClaim.attachments).length > 45000) {
+                btn.disabled = false;
+                btn.innerText = "결재 승인 / 보관";
+                lucide.createIcons();
+                return showMessage("문서의 파일 용량이 커서 결재를 진행할 수 없습니다. 관리자에게 문의하세요.", "error");
+            }
+
+            try {
+                const result = await callApi('updateClaim', updatedClaim);
+                if(result.success) { 
+                    closeModal(); 
+                    showMessage("성공적으로 승인되었습니다.", "success"); 
+                } else {
+                    btn.disabled = false;
+                    btn.innerText = "결재 승인 / 보관";
+                }
+            } catch(e) {
+                btn.disabled = false;
+                btn.innerText = "결재 승인 / 보관";
+                lucide.createIcons();
+            }
+        }
+
+        function renderArchivePreview(claim, payoutDate) {
+            if (!state.settings.folderId) return showMessage("관리자 설정에서 Folder ID를 먼저 입력해야 합니다.", "error");
+
+            const lastSerial = (Number(state.settings.lastSerial) || 0) + 1;
+            const serial = String(lastSerial > 99 ? 1 : lastSerial).padStart(2, '0');
+            const dateStr = claim.createdAt.split('T')[0];
+            const fileName = `${dateStr}-${claim.targetChairman}-${claim.requesterName}-${serial}.pdf`;
+
+            const deptApprovedStep = claim.history?.find(h => h.step.includes(ROLES.DEPARTMENT_HEAD));
+            const deptName = deptApprovedStep ? deptApprovedStep.user : (claim.targetDeptHead || '미지정');
+
+            const chairmanUser = state.users.find(u => u.role === claim.targetChairman);
+            const finUser = state.users.find(u => u.role === ROLES.FINANCE_CHAIRMAN);
+            const repUser = state.users.find(u => u.role === ROLES.REPRESENTATIVE);
+            
+            const chairmanName = chairmanUser ? chairmanUser.name : '미지정';
+            const finName = finUser ? finUser.name : '미지정';
+            const repName = repUser ? repUser.name : '미지정';
+
+            const approverNames = `부서장: ${deptName}, ${claim.targetChairman}: ${chairmanName}, 재정위원장: ${finName}, 담임목사: ${repName}`;
+            const approvalLine = `부서장 → ${claim.targetChairman} → 재정위원장 → 담임목사`;
+
+            const layer = document.createElement('div');
+            layer.id = 'pdf-layer';
+            layer.className = 'fixed inset-0 z-[600] flex items-center justify-center p-4 bg-gray-900 animate-in fade-in overflow-y-auto no-scrollbar text-left';
+            layer.innerHTML = `
+                <div class="bg-white w-full max-w-2xl rounded-2xl shadow-2xl flex flex-col my-8 border-[10px] border-white">
+                    <div id="pdf-export-area" class="p-10 space-y-8 text-black relative bg-white" style="min-height:700px">
+                        <div class="flex justify-between items-start mb-6 border-b-4 border-black pb-6">
+                            <div class="pt-2 text-left">
+                                <h1 class="text-4xl font-black tracking-[0.2em]">재 정 신 청 서</h1>
+                                <p class="text-[10px] text-gray-400 font-bold uppercase mt-2">ARCHIVE CERTIFIED</p>
+                            </div>
+                            <table class="border-collapse border-2 border-black text-[10px] text-center">
+                                <tr>
+                                    <td rowspan="2" class="bg-gray-100 border border-black p-1 font-black w-6" style="writing-mode: vertical-rl;">결재</td>
+                                    <td class="bg-gray-100 border border-black py-1 px-3">기안자</td>
+                                    <td class="bg-gray-100 border border-black py-1 px-3">부서장</td>
+                                    <td class="bg-gray-100 border border-black py-1 px-3">${claim.targetChairman}</td>
+                                    <td class="bg-gray-100 border border-black py-1 px-3">재정위원장</td>
+                                    <td class="bg-gray-100 border border-black py-1 px-3">담임목사</td>
+                                </tr>
+                                <tr>
+                                    <td class="border border-black h-14 align-bottom pb-2 font-black">${claim.requesterName}</td>
+                                    <td class="border border-black h-14 align-bottom pb-2 font-black">${deptName}</td>
+                                    <td class="border border-black h-14 align-bottom pb-2 font-black">${chairmanUser ? chairmanUser.name : ''}</td>
+                                    <td class="border border-black h-14 align-bottom pb-2 font-black">${finUser ? finUser.name : ''}</td>
+                                    <td class="border border-black h-14 align-bottom pb-2 font-black">${repUser ? repUser.name : ''}</td>
+                                </tr>
+                            </table>
+                        </div>
+                        <div class="grid grid-cols-4 border-2 border-black text-xs text-left">
+                            <div class="bg-gray-100 p-3 border-r-2 border-b-2 font-black text-center">결재담당</div><div class="p-3 border-b-2 font-bold col-span-3">${approverNames}</div>
+                            <div class="bg-gray-100 p-3 border-r-2 border-b-2 font-black text-center">결재경로</div><div class="p-3 border-b-2 font-bold col-span-3">${approvalLine}</div>
+                            <div class="bg-gray-100 p-3 border-r-2 border-b-2 font-black text-center">신청인</div><div class="p-3 border-r-2 border-b-2 text-center font-bold">${claim.requesterName}</div>
+                            <div class="bg-gray-100 p-3 border-r-2 border-b-2 font-black text-center">지급일자</div><div class="p-3 border-b-2 text-center font-black text-blue-600">${payoutDate}</div>
+                            <div class="bg-gray-100 p-3 border-r-2 font-black text-center">문서번호</div><div class="p-3 border-r-2 font-mono text-center text-[10px]">${fileName.replace('.pdf', '')}</div>
+                            <div class="bg-gray-100 p-3 font-black text-center">상태</div><div class="p-3 text-center text-green-600 font-black">CERTIFIED</div>
+                        </div>
+                        <div class="space-y-4 text-left text-left"><p class="font-black text-xs border-l-4 border-black pl-2 text-left">세부 항목</p>
+                            <table class="w-full border-collapse border-2 border-black text-[10px] text-left">
+                                <thead><tr class="bg-gray-50 border-b-2 border-black text-left"><th class="p-2 text-left">내용</th><th class="p-2 text-right">금액</th><th class="p-2 text-center text-center">은행</th></tr></thead>
+                                <tbody>${claim.items.map(i => `<tr class="border-b border-black text-left"><td class="p-2 font-bold text-left">${i.title}</td><td class="p-2 text-right font-mono text-right">${i.amount.toLocaleString()}</td><td class="p-2 text-center text-center">${i.bankName}</td></tr>`).join('')}<tr class="bg-gray-100 font-black text-left"><td class="p-2 text-center text-center" colspan="1">합 계</td><td class="p-2 text-right font-mono text-right" colspan="2">${Number(claim.totalAmount).toLocaleString()} KRW</td></tr></tbody>
+                            </table>
+                        </div>
+                        ${claim.attachments?.length > 0 ? `
+                        <div class="space-y-4 text-left mt-8 pt-6 border-t-2 border-black border-dashed">
+                            <p class="font-black text-xs border-l-4 border-black pl-2 text-left">증빙 첨부 자료</p>
+                            <div class="grid grid-cols-2 gap-4">
+                                ${claim.attachments.map(a => `<img src="${a.data}" class="w-full border-2 border-black shadow-sm object-cover">`).join('')}
+                            </div>
+                        </div>` : ''}
+                    </div>
+                    <div class="p-8 bg-gray-50 border-t flex flex-col gap-4 text-left">
+                        <div class="p-4 bg-white rounded-xl border flex items-center gap-3 text-left"><i data-lucide="file-check" class="text-blue-600"></i><p class="text-xs font-mono font-black">${fileName}</p></div>
+                        <div class="flex gap-3 text-left"><button onclick="document.getElementById('pdf-layer').remove()" class="flex-1 p-4 bg-white border rounded-xl font-black text-gray-400 transition-all hover:bg-gray-100">취소</button>
+                            <button id="final-btn" onclick="finalizeArchive('${claim.id}', '${fileName}', '${payoutDate}')" class="flex-[2] p-4 bg-blue-600 text-white rounded-xl font-black shadow-xl flex items-center justify-center gap-2 hover:bg-blue-700 transition-all text-center"><i data-lucide="cloud-upload"></i> 드라이브 업로드 및 완료</button>
+                        </div>
+                    </div>
+                </div>`;
+            document.body.appendChild(layer);
+            lucide.createIcons();
+        }
+
+        async function finalizeArchive(id, fn, pd) {
+            const btn = document.getElementById('final-btn');
+            const c = state.claims.find(cl => cl.id === id);
+            if (!state.settings.folderId) return showMessage("폴더 ID가 설정되지 않았습니다.", "error");
+            
+            btn.disabled = true; 
+            btn.innerHTML = `<i data-lucide="loader-2" class="animate-spin w-5 h-5 mr-2 mx-auto"></i> 처리 중... (최대 10초)`;
+            lucide.createIcons();
+            
+            const nextSerial = (Number(state.settings.lastSerial) || 0) + 1;
+            const finalSerial = nextSerial > 99 ? 1 : nextSerial;
+
+            const deptApprovedStep = c.history?.find(h => h.step.includes(ROLES.DEPARTMENT_HEAD));
+            const deptName = deptApprovedStep ? deptApprovedStep.user : (c.targetDeptHead || '미지정');
+
+            const chairmanUser = state.users.find(u => u.role === c.targetChairman);
+            const finUser = state.users.find(u => u.role === ROLES.FINANCE_CHAIRMAN);
+            const repUser = state.users.find(u => u.role === ROLES.REPRESENTATIVE);
+            
+            const chairmanName = chairmanUser ? chairmanUser.name : '미지정';
+            const finName = finUser ? finUser.name : '미지정';
+            const repName = repUser ? repUser.name : '미지정';
+
+            const approvalLine = `부서장 → ${c.targetChairman} → 재정위원장 → 담임목사`;
+            const approverNamesText = `부서장: ${deptName}, ${c.targetChairman}: ${chairmanName}, 재정위원장: ${finName}, 담임목사: ${repName}`;
+            
+            const approvers = {
+                requester: c.requesterName,
+                deptName: deptName,
+                chairmanRole: c.targetChairman,
+                chairmanName: chairmanName,
+                financeName: finName,
+                repName: repName
+            };
+            
+            const claimDataWithLine = { ...c, formattedApprovalLine: approvalLine, approverNamesText: approverNamesText, approvers: approvers };
+
+            try {
+                const element = document.getElementById('pdf-export-area');
+                const canvas = await html2canvas(element, { scale: 2, useCORS: true, backgroundColor: '#ffffff' });
+                const imgData = canvas.toDataURL('image/jpeg', 1.0);
+                
+                const { jsPDF } = window.jspdf;
+                const pdf = new jsPDF('p', 'mm', 'a4');
+                const pdfWidth = pdf.internal.pageSize.getWidth();
+                const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
+                const pageHeight = pdf.internal.pageSize.getHeight();
+                
+                let heightLeft = pdfHeight;
+                let position = 0;
+                
+                pdf.addImage(imgData, 'JPEG', 0, position, pdfWidth, pdfHeight);
+                heightLeft -= pageHeight;
+                
+                while (heightLeft > 0) {
+                    position = heightLeft - pdfHeight;
+                    pdf.addPage();
+                    pdf.addImage(imgData, 'JPEG', 0, position, pdfWidth, pdfHeight);
+                    heightLeft -= pageHeight;
+                }
+                
+                const pdfBase64 = pdf.output('datauristring').split(',')[1];
+
+                const result = await callApi('archiveAndComplete', { 
+                    folderId: state.settings.folderId, 
+                    fileName: fn, 
+                    claimData: claimDataWithLine,
+                    payoutDate: pd,
+                    nextSerial: finalSerial,
+                    userName: state.user.name,
+                    removeAttachmentsAfterComplete: true,
+                    pdfBase64: pdfBase64,
+                    isBase64Pdf: true 
+                });
+
+                if (result && result.success) {
+                    const layer = document.getElementById('pdf-layer');
+                    if (layer) layer.remove();
+                    closeModal(); 
+                    showMessage("드라이브 보관 및 지급 완료 처리가 되었습니다.", "success");
+                } else {
+                    btn.disabled = false;
+                    btn.innerHTML = `<i data-lucide="cloud-upload"></i> 드라이브 업로드 및 완료`;
+                    lucide.createIcons();
+                }
+            } catch(e) {
+                btn.disabled = false;
+                btn.innerHTML = `<i data-lucide="cloud-upload"></i> 드라이브 업로드 및 완료`;
+                lucide.createIcons();
+            }
+        }
+
+        function renderApprovalList(el) { renderDashboard(el); }
+        
+        function renderProfile(el) {
+            el.innerHTML = `
+                <div class="max-w-2xl mx-auto py-10 animate-in text-left">
+                    <div class="bg-white p-12 rounded-[3rem] shadow-sm text-center border relative overflow-hidden">
+                        <div class="absolute top-0 left-0 w-full h-2 bg-blue-600"></div>
+                        <div class="w-24 h-24 bg-blue-50 text-blue-600 rounded-3xl flex items-center justify-center mx-auto mb-6 font-black text-2xl uppercase">${state.user.role.substring(0,2)}</div>
+                        <h2 class="text-3xl font-black mb-2">${state.user.name}</h2>
+                        <p class="text-gray-400 font-black mb-6 font-mono text-center">${state.user.phone}</p>
+                        <div class="flex justify-center">${getBadgeHtml(state.user.role)}</div>
+                    </div>
+                    <div class="bg-white p-10 rounded-[3rem] shadow-sm border mt-8">
+                        <h3 class="text-xl font-black mb-8 flex items-center gap-3 text-blue-600"><i data-lucide="user-cog"></i> 권한 신청</h3>
+                        <div class="space-y-8 text-left">
+                            <div class="text-left"><label class="text-[10px] font-black text-gray-400 block mb-3 uppercase tracking-widest">등급 선택</label>
+                                <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+                                    ${ROLE_ORDER.map(r => `<button onclick="upgradeTargetRole='${r}';renderProfile(document.getElementById('content-area'))" class="p-4 text-xs font-black rounded-2xl border-2 transition-all ${upgradeTargetRole === r ? 'bg-blue-600 text-white border-blue-600' : 'bg-gray-50 border-transparent text-gray-400'}">${r}</button>`).join('')}
+                                </div>
+                            </div>
+                            <div class="text-left"><label class="text-[10px] font-black text-gray-400 block mb-3 uppercase tracking-widest text-left">비밀번호</label><input id="upgrade-pw" type="password" class="w-full p-5 bg-gray-50 border-2 border-gray-100 rounded-[1.5rem] text-center font-mono font-black text-xl" placeholder="••••••••"></div>
+                            <button onclick="applyUpgrade()" class="w-full bg-blue-600 text-white p-6 rounded-[1.5rem] font-black text-xl hover:bg-blue-700 shadow-2xl transition-all">신청 적용</button>
+                        </div>
+                    </div>
+                </div>`;
+            lucide.createIcons();
+        }
+
+        async function applyUpgrade() {
+            const pw = document.getElementById('upgrade-pw').value;
+            if(!upgradeTargetRole) return showMessage("등급을 선택하세요.", "error");
+            
+            if(String(pw) !== String(state.settings.rolePassword || 'elgrace1189!!')) return showMessage("비밀번호가 틀립니다.", "error");
+            
+            if(await callApi('loginOrRegister', { uid: state.user.uid, name: state.user.name, phone: state.user.phone, role: upgradeTargetRole })) { 
+                state.user.role = upgradeTargetRole; localStorage.setItem('a_finance_user', JSON.stringify(state.user)); 
+                showMessage("권한이 상향되었습니다.", "success"); upgradeTargetRole = ""; switchTab('dashboard'); 
+            }
+        }
+
+        function renderAdmin(el) {
+            el.innerHTML = `
+                <div class="space-y-10 text-left">
+                    <h2 class="text-3xl font-black text-gray-800">통합 관리자</h2>
+                    <section class="bg-white p-8 rounded-[2rem] border border-gray-100 space-y-6">
+                        <h3 class="text-xl font-black flex items-center gap-2"><i data-lucide="settings" class="text-blue-600"></i> 환경 설정</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div class="bg-gray-50 p-4 rounded-xl text-left"><label class="text-[10px] font-black text-gray-400 block mb-1 uppercase">Drive Folder ID</label><input id="fid" class="w-full bg-transparent font-mono text-sm font-bold outline-none" value="${state.settings.folderId||''}" placeholder="폴더 ID 입력"></div>
+                            <div class="bg-gray-50 p-4 rounded-xl text-left"><label class="text-[10px] font-black text-gray-400 block mb-1 uppercase">App Login Password</label><input id="app-login-pw" type="text" class="w-full bg-transparent font-mono text-sm font-bold outline-none" value="${state.settings.appLoginPassword||'4735'}"></div>
+                        </div>
+                        <button onclick="saveAdmin()" class="w-full bg-blue-600 text-white p-4 rounded-xl font-black shadow-lg hover:bg-blue-700 transition-all text-center">저장하기</button>
+                    </section>
+                    <section class="bg-white rounded-[2rem] border border-gray-100 overflow-hidden text-left"><table class="w-full text-left"><thead class="bg-gray-50 border-b text-[10px] font-black text-gray-400 uppercase tracking-widest"><tr><th class="p-5 text-left">성함</th><th class="p-5 text-left">권한</th><th class="p-5 text-center text-center">수정</th></tr></thead><tbody class="divide-y divide-gray-100">
+                                ${state.users.map(u => `<tr><td class="p-5 font-black text-left">${u.name}</td><td class="p-5 text-left">${getBadgeHtml(u.role)}</td><td class="p-5 text-center text-center"><select onchange="updateRole('${u.uid}', '${u.name}', '${u.phone}', this.value)" class="text-xs border p-2 rounded-lg font-bold outline-none text-center">${ROLE_ORDER.map(r => `<option value="${r}" ${u.role===r?'selected':''}>${r}</option>`).join('')}</select></td></tr>`).join('')}
+                    </tbody></table></section>
+                </div>`;
+            lucide.createIcons();
+        }
+
+        async function saveAdmin() { 
+            const folderId = document.getElementById('fid').value;
+            const appLoginPassword = document.getElementById('app-login-pw').value;
+            await callApi('updateSettings', { folderId, appLoginPassword }); 
+            showMessage("설정값이 저장되었습니다.", "success"); 
+        }
+
+        async function updateRole(uid, name, phone, role) { await callApi('loginOrRegister', { uid, name, phone, role }); showMessage("권한이 수정되었습니다.", "success"); }
+
+        const canActionDoc = (c) => {
+            const role = state.user.role;
+            if (role === ROLES.MANAGER) return true;
+            // 💡 권한 검증: '부서장' 권한이면서, 지정된 부서장 본인이어야 액션(승인) 가능
+            if (c.status === STATUS.PENDING_0 && role === ROLES.DEPARTMENT_HEAD && (c.targetDeptHead || '').trim() === state.user.name.trim()) return true;
+            if (c.status === STATUS.PENDING_1 && c.targetChairman === role) return true;
+            if (c.status === STATUS.PENDING_2 && role === ROLES.FINANCE_CHAIRMAN) return true;
+            if (c.status === STATUS.PENDING_FINAL && role === ROLES.REPRESENTATIVE) return true;
+            if (c.status === STATUS.PENDING_PAYMENT && role === ROLES.FINANCE_CHAIRMAN) return true;
+            return false;
+        };
+
+        window.onload = async () => { if (state.gasUrl) await refreshData(); else render(); };
+    </script>
+</body>
+</html>
